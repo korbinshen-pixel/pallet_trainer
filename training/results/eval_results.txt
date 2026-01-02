@@ -1,0 +1,17 @@
+Pallet Pose Estimation Evaluation Results
+================================================================================
+Average Loss: 0.035702
+
+Position Error (meters):
+  position_error_mean: 0.209647
+  position_error_std: 0.228984
+  position_error_median: 0.152741
+  position_error_min: 0.005650
+  position_error_max: 1.898428
+
+Rotation Error (degrees):
+  rotation_error_mean: 3.323761
+  rotation_error_std: 4.107122
+  rotation_error_median: 1.809673
+  rotation_error_min: 0.000000
+  rotation_error_max: 21.647467
