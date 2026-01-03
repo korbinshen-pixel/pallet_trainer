@@ -1,172 +1,196 @@
-# eval.py
+import os
 import torch
 import numpy as np
 from tqdm import tqdm
-import logging
-import os
+import argparse
+import json
 
 import config
 from dataset import get_dataloaders
 from model import PalletPoseEstimator, PalletPoseLoss
 
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-
-def quaternion_to_euler(q):
-    """
-    四元数转欧拉角
-    Args:
-        q: [qx, qy, qz, qw]
-    Returns:
-        [roll, pitch, yaw] in degrees
-    """
-    qx, qy, qz, qw = q
+class Evaluator:
+    """模型评估类"""
     
-    # Roll (x-axis)
-    sinr_cosp = 2 * (qw * qx + qy * qz)
-    cosr_cosp = 1 - 2 * (qx * qx + qy * qy)
-    roll = np.arctan2(sinr_cosp, cosr_cosp)
+    def __init__(self, model_path, device=config.DEVICE):
+        """
+        Args:
+            model_path: 保存的模型路径
+            device: 运行设备
+        """
+        self.device = torch.device(device)
+        
+        # 加载模型
+        self.model = PalletPoseEstimator(pretrained=False)
+        checkpoint = torch.load(model_path, map_location=self.device)
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.model.to(self.device)
+        self.model.eval()
+        
+        # 损失函数
+        self.criterion = PalletPoseLoss(
+            position_weight=config.POSITION_LOSS_WEIGHT,
+            rotation_weight=config.ROTATION_LOSS_WEIGHT
+        )
+        
+        print(f"Model loaded from {model_path}")
     
-    # Pitch (y-axis)
-    sinp = 2 * (qw * qy - qz * qx)
-    sinp = np.clip(sinp, -1, 1)
-    pitch = np.arcsin(sinp)
+    def evaluate(self, data_loader):
+        """评估数据集
+        
+        Args:
+            data_loader: PyTorch DataLoader
+        
+        Returns:
+            metrics: dict with evaluation metrics
+        """
+        total_loss = 0.0
+        total_pos_loss = 0.0
+        total_rot_loss = 0.0
+        
+        position_errors = []
+        rotation_errors = []
+        
+        with torch.no_grad():
+            for batch in tqdm(data_loader, desc='Evaluating'):
+                rgb = batch['rgb'].to(self.device)
+                depth = batch['depth'].to(self.device)
+                position_gt = batch['position'].to(self.device)
+                rotation_gt = batch['rotation'].to(self.device)
+                
+                # 前向传播
+                position_pred, rotation_pred = self.model(rgb, depth)
+                
+                # 计算损失
+                loss, pos_loss, rot_loss = self.criterion(
+                    position_pred, rotation_pred,
+                    position_gt, rotation_gt
+                )
+                
+                total_loss += loss.item()
+                total_pos_loss += pos_loss.item()
+                total_rot_loss += rot_loss.item()
+                
+                # 计算误差
+                pos_error = torch.norm(position_pred - position_gt, dim=1)  # (B,)
+                rot_error = torch.norm(rotation_pred - rotation_gt, dim=1)  # (B,)
+                
+                position_errors.extend(pos_error.cpu().numpy().tolist())
+                rotation_errors.extend(rot_error.cpu().numpy().tolist())
+        
+        # 统计指标
+        metrics = {
+            'total_loss': total_loss / len(data_loader),
+            'position_loss': total_pos_loss / len(data_loader),
+            'rotation_loss': total_rot_loss / len(data_loader),
+            'position_error_mean': np.mean(position_errors),
+            'position_error_std': np.std(position_errors),
+            'position_error_max': np.max(position_errors),
+            'rotation_error_mean': np.mean(rotation_errors),
+            'rotation_error_std': np.std(rotation_errors),
+            'rotation_error_max': np.max(rotation_errors),
+        }
+        
+        return metrics
     
-    # Yaw (z-axis)
-    siny_cosp = 2 * (qw * qz + qx * qy)
-    cosy_cosp = 1 - 2 * (qy * qy + qz * qz)
-    yaw = np.arctan2(siny_cosp, cosy_cosp)
-    
-    return np.array([np.degrees(roll), np.degrees(pitch), np.degrees(yaw)])
-
-
-def evaluate(model, test_loader, device=config.DEVICE):
-    """评估模型"""
-    model.eval()
-    criterion = PalletPoseLoss()
-    
-    total_loss = 0.0
-    position_errors = []
-    rotation_errors = []
-    
-    with torch.no_grad():
-        pbar = tqdm(test_loader, desc='Evaluating')
-        for batch in pbar:
-            rgb = batch['rgb'].to(device)
-            depth = batch['depth'].to(device)
-            position_gt = batch['position'].to(device)
-            rotation_gt = batch['rotation'].to(device)
-            
-            # 前向传播
-            position_pred, rotation_pred = model(rgb, depth)
-            
-            # 计算损失
-            loss, _, _ = criterion(position_pred, rotation_pred, 
-                                   position_gt, rotation_gt)
-            total_loss += loss.item()
-            
-            # 计算位置误差（L2 距离，单位：米）
-            pos_error = torch.norm(position_pred - position_gt, dim=1)
-            position_errors.extend(pos_error.cpu().numpy())
-            
-            # 计算旋转误差（四元数距离）
-            # 使用两个四元数之间的夹角作为旋转误差
-            cos_sim = torch.nn.functional.cosine_similarity(
-                rotation_pred, rotation_gt, dim=1, eps=1e-8
-            )
-            # 限制在 [-1, 1]
-            cos_sim = torch.clamp(cos_sim, -1, 1)
-            rot_angle = torch.acos(torch.abs(cos_sim))
-            rot_error_deg = torch.rad2deg(rot_angle)
-            rotation_errors.extend(rot_error_deg.cpu().numpy())
-    
-    # 统计信息
-    position_errors = np.array(position_errors)
-    rotation_errors = np.array(rotation_errors)
-    
-    results = {
-        'avg_loss': total_loss / len(test_loader),
-        'position_error_mean': position_errors.mean(),
-        'position_error_std': position_errors.std(),
-        'position_error_median': np.median(position_errors),
-        'position_error_max': position_errors.max(),
-        'position_error_min': position_errors.min(),
-        'rotation_error_mean': rotation_errors.mean(),
-        'rotation_error_std': rotation_errors.std(),
-        'rotation_error_median': np.median(rotation_errors),
-        'rotation_error_max': rotation_errors.max(),
-        'rotation_error_min': rotation_errors.min(),
-    }
-    
-    return results
+    def print_metrics(self, metrics, title='Evaluation Results'):
+        """打印评估指标"""
+        print(f"\n{'='*60}")
+        print(f"{title}")
+        print(f"{'='*60}")
+        print(f"Total Loss: {metrics['total_loss']:.6f}")
+        print(f"Position Loss: {metrics['position_loss']:.6f}")
+        print(f"Rotation Loss: {metrics['rotation_loss']:.6f}")
+        print(f"\nPosition Error (m):")
+        print(f"  Mean: {metrics['position_error_mean']:.6f}")
+        print(f"  Std: {metrics['position_error_std']:.6f}")
+        print(f"  Max: {metrics['position_error_max']:.6f}")
+        print(f"\nRotation Error:")
+        print(f"  Mean: {metrics['rotation_error_mean']:.6f}")
+        print(f"  Std: {metrics['rotation_error_std']:.6f}")
+        print(f"  Max: {metrics['rotation_error_max']:.6f}")
+        print(f"{'='*60}\n")
 
 
 def main():
-    logger.info('=' * 80)
-    logger.info('Pallet Pose Estimation Evaluation')
-    logger.info('=' * 80)
+    parser = argparse.ArgumentParser(description='Evaluate Pallet Pose Estimator')
+    parser.add_argument('--model', type=str, required=True,
+                        help='Path to the trained model')
+    parser.add_argument('--dataset_dir', type=str, default=None,
+                        help='Path to the dataset directory')
+    parser.add_argument('--device', type=str, default=config.DEVICE,
+                        help='Device to use (cuda or cpu)')
+    parser.add_argument('--split', type=str, default='test',
+                        help='Data split to evaluate (train/val/test)')
+    parser.add_argument('--output', type=str, default=None,
+                        help='Save metrics to JSON file')
+    
+    args = parser.parse_args()
     
     # 加载数据集
-    logger.info('Loading dataset...')
-    _, _, test_loader = get_dataloaders()
+    print(f"Loading {args.split} dataset...")
+    from dataset import PalletPoseDataset
+    from torch.utils.data import DataLoader
+    from torchvision import transforms
     
-    # 加载模型
-    logger.info('Loading model...')
-    model = PalletPoseEstimator()
+    # RGB 美化变换
+    rgb_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean=config.RGB_MEAN, std=config.RGB_STD)
+    ])
     
-    best_model_path = os.path.join(config.MODEL_DIR, 'checkpoint_epoch_055.pth')
-    if not os.path.exists(best_model_path):
-        logger.error(f'Model not found: {best_model_path}')
-        return
+    # 深度预处理
+    def depth_transform(depth):
+        if isinstance(depth, torch.Tensor):
+            depth_tensor = depth
+        else:
+            depth_tensor = torch.from_numpy(depth)
+        
+        if depth_tensor.dim() == 2:
+            depth_tensor = depth_tensor.unsqueeze(0)
+        
+        if config.DEPTH_NORMALIZE:
+            mean = depth_tensor.mean()
+            std = depth_tensor.std()
+            if std > 0:
+                depth_tensor = (depth_tensor - mean) / std
+        else:
+            maxv = depth_tensor.max()
+            if maxv > 0:
+                depth_tensor = depth_tensor / maxv
+        
+        return depth_tensor
     
-    checkpoint = torch.load(best_model_path, map_location=config.DEVICE)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    model.to(config.DEVICE)  # <-- 加这一行
-    logger.info(f'Model loaded from {best_model_path}')
+    # 加载数据集
+    if args.dataset_dir is None:
+        from dataset import get_latest_dataset_dir
+        args.dataset_dir = get_latest_dataset_dir()
+    
+    dataset = PalletPoseDataset(
+        args.dataset_dir, split=args.split,
+        transform_rgb=rgb_transform,
+        transform_depth=depth_transform,
+        augmentation=False
+    )
+    
+    data_loader = DataLoader(
+        dataset, batch_size=config.INFER_BATCH_SIZE,
+        shuffle=False, num_workers=4
+    )
+    
+    # 创建评估器
+    evaluator = Evaluator(args.model, args.device)
     
     # 评估
-    logger.info('Evaluating...')
-    results = evaluate(model, test_loader)
-    
-    # 打印结果
-    logger.info('=' * 80)
-    logger.info('Evaluation Results:')
-    logger.info('=' * 80)
-    logger.info(f'Average Loss: {results["avg_loss"]:.6f}')
-    logger.info('')
-    logger.info('Position Error (meters):')
-    logger.info(f'  Mean:   {results["position_error_mean"]:.6f}')
-    logger.info(f'  Std:    {results["position_error_std"]:.6f}')
-    logger.info(f'  Median: {results["position_error_median"]:.6f}')
-    logger.info(f'  Min:    {results["position_error_min"]:.6f}')
-    logger.info(f'  Max:    {results["position_error_max"]:.6f}')
-    logger.info('')
-    logger.info('Rotation Error (degrees):')
-    logger.info(f'  Mean:   {results["rotation_error_mean"]:.6f}')
-    logger.info(f'  Std:    {results["rotation_error_std"]:.6f}')
-    logger.info(f'  Median: {results["rotation_error_median"]:.6f}')
-    logger.info(f'  Min:    {results["rotation_error_min"]:.6f}')
-    logger.info(f'  Max:    {results["rotation_error_max"]:.6f}')
-    logger.info('=' * 80)
+    metrics = evaluator.evaluate(data_loader)
+    evaluator.print_metrics(metrics, f'{args.split.upper()} Evaluation Results')
     
     # 保存结果
-    result_file = os.path.join(config.RESULT_DIR, 'eval_results.txt')
-    with open(result_file, 'w') as f:
-        f.write('Pallet Pose Estimation Evaluation Results\n')
-        f.write('=' * 80 + '\n')
-        f.write(f'Average Loss: {results["avg_loss"]:.6f}\n\n')
-        f.write('Position Error (meters):\n')
-        for key in ['position_error_mean', 'position_error_std', 'position_error_median', 
-                    'position_error_min', 'position_error_max']:
-            f.write(f'  {key}: {results[key]:.6f}\n')
-        f.write('\nRotation Error (degrees):\n')
-        for key in ['rotation_error_mean', 'rotation_error_std', 'rotation_error_median',
-                    'rotation_error_min', 'rotation_error_max']:
-            f.write(f'  {key}: {results[key]:.6f}\n')
-    
-    logger.info(f'Results saved to {result_file}')
+    if args.output:
+        with open(args.output, 'w') as f:
+            json.dump(metrics, f, indent=4)
+        print(f"Metrics saved to {args.output}")
 
 
 if __name__ == '__main__':
