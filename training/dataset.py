@@ -1,4 +1,3 @@
-# dataset.py
 import os
 import numpy as np
 import torch
@@ -39,10 +38,10 @@ class PalletPoseDataset(Dataset):
         │   ├── rgb_000001.png
         │   └── ...
         ├── depth/
-        │   ├── depth_000000.npy
-        │   ├── depth_000001.npy
+        │   ├── depth_000000.png
+        │   ├── depth_000001.png
         │   └── ...
-        └── poses.txt  (每行：frame_id x y z qx qy qz qw)
+        └── poses.txt  (each line: frame_id x y z qx qy qz qw)
     """
     
     def __init__(self, dataset_dir, split='train', transform_rgb=None, 
@@ -75,7 +74,7 @@ class PalletPoseDataset(Dataset):
         
         # 读取 RGB 文件列表（按名字排序）
         self.rgb_files = sorted(glob.glob(os.path.join(self.rgb_dir, 'rgb_*.png')))
-        self.depth_files = sorted(glob.glob(os.path.join(self.depth_dir, 'depth_*.npy')))
+        self.depth_files = sorted(glob.glob(os.path.join(self.depth_dir, 'depth_*.png')))
         
         # 读取位姿数据
         self.poses = self._load_poses()
@@ -118,7 +117,7 @@ class PalletPoseDataset(Dataset):
                 parts = line.strip().split()
                 frame_id = parts[0]
                 pose = np.array([float(x) for x in parts[1:]], dtype=np.float32)
-                # pose 应该是 7D：位置3D + 四元数4D
+                # pose 应该是 7D：位置3D + 四元摰4D
                 assert len(pose) == 7, f"Pose should be 7D, got {len(pose)}"
                 poses[frame_id] = pose
         return poses
@@ -134,22 +133,10 @@ class PalletPoseDataset(Dataset):
         rgb_path = self.rgb_files[actual_idx]
         rgb = Image.open(rgb_path).convert('RGB')
         
-        # 加载深度图像
-        # 加载深度图像
+        # 加载深度图像（16bit PNG）
         depth_path = self.depth_files[actual_idx]
-        depth = np.load(depth_path).astype(np.float32)  # (H, W)
-
-        # 数据增强（如果有的话），这里建议暂时不要改 depth 的类型
-        if self.augmentation and self.split == 'train':
-            rgb, depth = self._augment(rgb, depth)
-
-        # 转换为张量 / 归一化
-        if self.transform_depth:
-            depth = self.transform_depth(depth)   # 让它接 numpy 或 tensor 自己处理
-        else:
-            depth = torch.from_numpy(depth).unsqueeze(0)  # (1, H, W)
-
-
+        depth_img = Image.open(depth_path)
+        depth = np.array(depth_img, dtype=np.float32)  # (H, W) in mm
         
         # 提取位姿（从文件名提取 frame_id）
         frame_id = os.path.basename(rgb_path).replace('rgb_', '').replace('.png', '')
@@ -171,7 +158,7 @@ class PalletPoseDataset(Dataset):
         if self.transform_depth:
             depth = self.transform_depth(depth)
         else:
-            depth = torch.from_numpy(depth)
+            depth = torch.from_numpy(depth).unsqueeze(0)  # (1, H, W)
         
         # 返回数据
         return {
@@ -188,8 +175,7 @@ class PalletPoseDataset(Dataset):
         if np.random.rand() > 0.5:
             brightness_factor = 1 + np.random.uniform(-config.AUGMENT_RGB_BRIGHTNESS, 
                                                        config.AUGMENT_RGB_BRIGHTNESS)
-            rgb = Image.new('RGB', rgb.size)
-            # 简单亮度调整...（这里为了简洁省略详细实现）
+            enhancer = transforms.RandomAdjustSharpness(0.5)
         
         return rgb, depth
 
@@ -214,16 +200,13 @@ def get_dataloaders(dataset_dir=None, batch_size=config.BATCH_SIZE):
         transforms.Normalize(mean=config.RGB_MEAN, std=config.RGB_STD)
     ])
     
-    # 深度图像的处理（简单转张量）
+    # 深度图像的处理
     def depth_transform(depth):
-
         """
         通用深度预处理：
         - 输入可以是 np.ndarray(H, W) 或 Tensor(H, W) 或 Tensor(1, H, W)
         - 输出统一为 Tensor(1, H, W)
         """
-        import torch
-
         # 1. 统一成 torch.Tensor
         if isinstance(depth, torch.Tensor):
             depth_tensor = depth
@@ -231,11 +214,8 @@ def get_dataloaders(dataset_dir=None, batch_size=config.BATCH_SIZE):
             # 假设是 numpy
             depth_tensor = torch.from_numpy(depth)
 
-        # 2. 去掉多余的 batch 维，保证最多 3 维
-        # 例如有时候可能是 (1, H, W)，有时候 (H, W)
+        # 2. 保证是 2D 或 3D
         if depth_tensor.dim() == 3 and depth_tensor.size(0) != 1:
-            # 极端情况 (H, W, C) 这种，不太可能出现在当前管线，先简单处理
-            # 这里取第一个通道
             depth_tensor = depth_tensor[0, ...]
         
         # 3. 确保现在是 (H, W) 或 (1, H, W)
@@ -246,22 +226,22 @@ def get_dataloaders(dataset_dir=None, batch_size=config.BATCH_SIZE):
             # 已经是 (1, H, W)，OK
             pass
         else:
-            raise ValueError(f"Unexpected depth shape in depth_transform: {depth_tensor.shape}")
+            raise ValueError(f"Unexpected depth shape: {depth_tensor.shape}")
 
-        # 4. 归一化：在 (1, H, W) 上做
+        # 4. 归一化
         if config.DEPTH_NORMALIZE:
+            # 按 (1, H, W) 形状做 z-score 归一化
             mean = depth_tensor.mean()
             std = depth_tensor.std()
             if std > 0:
                 depth_tensor = (depth_tensor - mean) / std
         else:
+            # 简单最大值归一化
             maxv = depth_tensor.max()
             if maxv > 0:
                 depth_tensor = depth_tensor / maxv
 
         return depth_tensor
-
-
     
     # 创建三个数据集
     train_dataset = PalletPoseDataset(
@@ -287,7 +267,7 @@ def get_dataloaders(dataset_dir=None, batch_size=config.BATCH_SIZE):
     
     # 创建数据加载器
     train_loader = DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, drop_last=True  # <-- 加上这一行！
+        train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, drop_last=True
     )
     
     val_loader = DataLoader(
