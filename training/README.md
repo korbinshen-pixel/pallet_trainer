@@ -1,135 +1,226 @@
-# 托盘位姿估计模型训练框架
+# 托盘位姿估计训练框架
 
-## 快速开始
+## 上活盘位姿估计
 
-### 1. 数据准备
+基于 RGB 图像 (8-bit PNG) + 深度图像 (16-bit PNG) 使用大视野 CNN 学习托盘的位置（三维坐标）和姿态（四元数旋转）。
 
-确保你已经用 `data_collector` 采集了数据，数据放在 `~/pallet_dataset/` 目录下。
+## 项目结构
 
-目录结构：
+```
+training/
+├── config.py              # 配置文件
+├── dataset.py             # 数据加载器 (RGB 8-bit + Depth 16-bit PNG)
+├── model.py               # 模型定义 (ResNet50 双分支)
+├── train.py               # 训练脚本
+├── eval.py                # 评估脚本
+├── infer.py               # 推理脚本
+├── checkpoints/           # 检查点保存目录
+├── models/                # 模型保存目录
+├── logs/                  # 日志目录 (TensorBoard)
+├── results/               # 结果保存目录
+└── README.md              # 本文档
+```
 
+## 数据集执残模式
+
+### 目录结构
+
+```
 ~/pallet_dataset/
-20251210_153102/
-rgb/
-rgb_000000.png
-rgb_000001.png
+└── 20251210_162120/       # 改为你的数据集时间戳 (YYYYMMDD_HHMMSS)
+    ├── rgb/                # RGB 图像目录 (8-bit PNG)
+    │   ├── rgb_000000.png
+    │   ├── rgb_000001.png
+    │   └── ...
+    ├── depth/              # 深度图像目录 (16-bit PNG)
+    │   ├── depth_000000.png
+    │   ├── depth_000001.png
+    │   └── ...
+    └── poses.txt          # 位姿标注文件
+```
+
+### poses.txt 格式
+
+每行是一个托盘的位姿，格式如下：
+
+```
+frame_id x y z qx qy qz qw
+000000 0.123 0.456 0.789 0.0 0.0 0.707 0.707
+000001 0.124 0.457 0.790 0.001 0.001 0.707 0.707
 ...
-depth/
-depth_000000.npy
-depth_000001.npy
-...
-poses.txt
+```
 
-text
+- `frame_id`: 整数了，与图像文件名可搞应
+- `x, y, z`: 位置 (m)
+- `qx, qy, qz, qw`: 四元数 (袜绫旋转)
 
-### 2. 测试数据加载器
+## 使用方法
 
-python3 dataset.py
+### 1. 安装依赖
 
-text
+```bash
+pip install torch torchvision scikit-learn pillow tqdm tensorboard
+```
 
-如果输出显示 `DataLoader test passed!`，说明数据加载器工作正常。
+### 2. 配置数据集
 
-### 3. 测试模型
+编辑 `config.py`设置数据集路径：
 
-python3 model.py
+```python
+DATASET_ROOT = os.path.expanduser('~/pallet_dataset')
+```
 
-text
+### 3. 训练
 
-如果输出显示 `Model test passed!`，说明模型定义正确。
+```bash
+python train.py
+```
 
-### 4. 开始训练
+训练会自动找最新的数据集目录。
 
-python3 train.py
+**配置参数修改** (可选)：
 
-text
+```python
+# config.py
+BATCH_SIZE = 8
+LEARNING_RATE = 1e-4
+NUM_EPOCHS = 50
+WARMUP_EPOCHS = 5
+PATIENCE = 20  # Early stopping
+```
 
-训练过程会：
-- 保存检查点到 `checkpoints/`
-- 保存最好模型到 `models/best_model.pth`
-- 记录日志到 `logs/`
+### 4. 评估
 
-### 5. 实时查看训练进度（可选）
+```bash
+# 评估测试集
+python eval.py --model models/best_model.pth --split test --output results/metrics.json
 
-在另一个终端运行：
+# 评估你的数据集
+python eval.py --model models/best_model.pth --dataset_dir ~/pallet_dataset/20251210_162120 --split test
+```
 
-tensorboard --logdir=logs/
+### 5. 推理 (inference)
 
-text
+**单个图像：**
 
-然后在浏览器打开 `http://localhost:6006`
+```bash
+python infer.py --model models/best_model.pth \
+                --rgb_path test_rgb.png \
+                --depth_path test_depth.png
+```
 
-### 6. 评估模型
+**批量推理：**
 
-python3 eval.py
+```bash
+python infer.py --model models/best_model.pth \
+                --rgb_dir ~/pallet_dataset/20251210_162120/rgb \
+                --depth_dir ~/pallet_dataset/20251210_162120/depth \
+                --output results/predictions.txt
+```
 
-text
+## 模型体系
 
-输出位置误差和旋转误差统计。
+### 架构
 
-### 7. 推理
+```
+PalletPoseEstimator
+├── RGB Branch (ResNet-50 ImageNet 预训练)
+│   └── 2048D 特征
+├── Depth Branch (ResNet-50, 未预训练)
+│   └── 2048D 特征 (单通道在 3 通道中复制)
+├── Feature Fusion
+│   └── 4096D -> 1024D
+├── Position Head
+│   └── 3D 位置 (x, y, z)
+└── Rotation Head
+    └── 4D 四元数 (qx, qy, qz, qw)
+```
 
-python3 infer.py
+### 损失函数
 
-text
+- **位置损失**: MSE Loss
+- **旋转损失**: Cosine Distance Loss (四元数相似度)
+- **总損失**: position_weight * pos_loss + rotation_weight * rot_loss
 
-对新数据进行推理并输出位姿。
+## 整合器配置
 
-## 文件说明
+### 优化器
 
-| 文件 | 说明 |
-|------|------|
-| `config.py` | 所有超参数配置 |
-| `dataset.py` | 数据加载器 |
-| `model.py` | 模型定义 + 损失函数 |
-| `train.py` | 训练脚本 |
-| `eval.py` | 评估脚本 |
-| `infer.py` | 推理脚本 |
+- Adam optimizer
+- Learning rate: 1e-4
+- Weight decay: 1e-5
 
-## 调整超参数
+### 学习率调度
 
-编辑 `config.py`：
+- **预热（Warmup）**: 线性从 0.1 * LR 递优到 LR (5 epochs)
+- **衰减（Cosine Annealing）**: 余弦衰减到 1e-6 (45 epochs)
 
-- `BATCH_SIZE`: 批大小（如果显存不足改小）
-- `LEARNING_RATE`: 学习率（默认 1e-4）
-- `NUM_EPOCHS`: 训练轮数
-- `PATIENCE`: Early stopping 耐心（多少 epoch 没改进就停止）
-- `POSITION_LOSS_WEIGHT`, `ROTATION_LOSS_WEIGHT`: 损失函数权重
+## 结果文件
+
+### TensorBoard 可视化
+
+```bash
+tensorboard --logdir logs/
+```
+
+打开浏览器中访问 `http://localhost:6006`
+
+### 检查点
+
+- `checkpoints/checkpoint_epoch_XXX.pth`: 每个 epoch 的检查点
+- `models/best_model.pth`: 最优模型 (early stopping)
+
+## 批量处理脚本示例
+
+### 创建批量训练脚本 `train_batch.sh`
+
+```bash
+#!/bin/bash
+python train.py \
+    --dataset_dir ~/pallet_dataset/20251210_162120 \
+    --batch_size 16 \
+    --learning_rate 5e-5 \
+    --num_epochs 100
+```
 
 ## 常见问题
 
-### Q: CUDA out of memory
-A: 在 `config.py` 中降低 `BATCH_SIZE`
+### 深度图像处理
 
-### Q: 训练太慢
-A: 确保你的 GPU 被使用了：
+16-bit PNG 深度图像抽取后为 f32 类型。预处理：
 
-nvidia-smi # 查看 GPU 使用情况
+```python
+depth = np.array(Image.open(depth_path), dtype=np.float32)  # 单位: mm
+# 推荐正一化 (z-score)
+if config.DEPTH_NORMALIZE:
+    depth = (depth - mean) / std
+```
 
-text
+### 不匹配的囸量
 
-### Q: 模型精度不高
-A: 
-1. 增加训练数据
-2. 调整超参数（学习率、损失函数权重）
-3. 尝试更复杂的模型架构
+RGB 盯融吸收 ImageNet 预训练当加入专法:
 
-## 输出文件
+```python
+if pretrained:
+    self.rgb_backbone = resnet50(weights=ResNet50_Weights.IMAGENET1K_V1)
+else:
+    self.rgb_backbone = resnet50(weights=None)
+```
 
-training/
-├── checkpoints/ # 训练检查点
-├── models/
-│ └── best_model.pth # 最好模型权重
-├── logs/
-│ └── run_*/ # TensorBoard 日志
-├── results/
-│ └── eval_results.txt # 评估结果
-└── *.py # 脚本文件
+深度分支不采用预训练权重（不匹配）。
 
-text
+## 转接到其他像素或数据集
 
-## 下一步
+RGB/Depth 图像率先改正为上述的汽浅格式，有两个主要修改点：
 
-1. 使用 `infer.py` 在实际机器人上进行推理
-2. 如果精度不够，考虑升级到更复杂的模型（见推荐方案 3-5）
-3. 收集更多真实数据进行微调（fine-tuning）
+1. **`dataset.py`**: 改写 `_load_poses()` 处理你的标注格式
+2. **`config.py`**: 调整正一化参数 (RGB_MEAN, RGB_STD, 等)
+
+## 就业/感谢
+
+- 本框架基于 `pallet_trainer` 项目，整体掞化。
+- 特对应用: 16-bit PNG 深度图像支持、托盘 6-DOF 位姿估计
+
+## 许可证
+
+MIT License - 自由使用。
