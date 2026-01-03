@@ -1,4 +1,3 @@
-# model.py
 import torch
 import torch.nn as nn
 from torchvision.models import resnet50, ResNet50_Weights
@@ -79,8 +78,6 @@ class PalletPoseEstimator(nn.Module):
         rgb_feat = rgb_feat.view(rgb_feat.size(0), -1)  # (B, 2048)
         
         # 深度特征提取
-        # ResNet 期望 3 通道输入，所以把单通道深度复制到 3 通道
-        # 深度特征提取
         # 确保维度是 (B, 1, H, W)
         if depth.dim() == 3:
             # 可能是 (B, H, W)，补上通道维
@@ -100,8 +97,6 @@ class PalletPoseEstimator(nn.Module):
             depth_3ch = depth
 
         depth_feat = self.depth_backbone(depth_3ch)  # (B, 2048, 1, 1)
-        depth_feat = depth_feat.view(depth_feat.size(0), -1)  # (B, 2048)
-
         depth_feat = depth_feat.view(depth_feat.size(0), -1)  # (B, 2048)
         
         # 特征融合
