@@ -1,5 +1,6 @@
 # config.py
 import os
+import torch
 
 # ============ 数据路径 ============
 DATASET_ROOT = os.path.expanduser('~/pallet_dataset')
@@ -53,7 +54,7 @@ SAVE_INTERVAL = 5           # 每5个 epoch 保存一次检查点
 PATIENCE = 20               # Early stopping 耐心（多少个epoch没有改进就停止）
 
 # ============ 推理配置 ============
-DEVICE = 'cuda' if __import__('torch').cuda.is_available() else 'cpu'
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 INFER_BATCH_SIZE = 1
 
 # ============ 数据增强 ============
